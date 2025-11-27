@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class OCREngine:
-    def __init__(self, method='tesseract'):
+    def __init__(self, method='easyocr'):
         """
         Initialize OCR Engine.
         :param method: 'tesseract' or 'easyocr'
@@ -29,7 +29,7 @@ class OCREngine:
         self.method = method
         if self.method == 'easyocr' and EASYOCR_AVAILABLE:
             logger.info("Initializing EasyOCR Reader...")
-            self.reader = easyocr.Reader(['en'])
+            self.reader = easyocr.Reader(['en'], gpu=True)
         elif self.method == 'easyocr' and not EASYOCR_AVAILABLE:
              logger.warning("EasyOCR not available.")
 

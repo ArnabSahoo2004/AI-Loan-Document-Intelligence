@@ -26,8 +26,20 @@ class DataExtractor:
             "amount": r"Rs\.?\s?[\d,]+(?:\.\d{2})?",
             "ifsc": r"[A-Z]{4}0[A-Z0-9]{6}",
             # Fixed: Strict regex to not match across lines (e.g. avoiding 'Designation' from next line)
-            "name_regex": r"Name:[ \t]*([A-Za-z ]+)(?:\n|$)"
+            "name_regex": r"(?:Name|Employee Name|Emp Name)[\s:]+([A-Za-z ]+)(?:\n|$)"
         }
+        
+        # Load Custom NER Model
+        self.ner_model = None
+        try:
+            import os
+            model_path = os.path.join("models", "ner_model")
+            if os.path.exists(model_path):
+                import spacy
+                self.ner_model = spacy.load(model_path)
+                logger.info("Loaded custom NER model.")
+        except Exception as e:
+            logger.warning(f"Could not load custom NER model: {e}")
 
     def extract_entities(self, text):
         """
@@ -48,46 +60,107 @@ class DataExtractor:
         # Robust Extraction for Salary Components
         data["basic_salary"] = self._extract_key_value(text, ["Basic", "Basic Salary", "Basic Pay", "Basic & DA"])
         data["hra"] = self._extract_key_value(text, ["HRA", "House Rent Allowance"])
-        data["net_pay"] = self._extract_key_value(text, ["Net Pay", "Net Salary", "Take Home", "NET Salary"])
-        data["total_earnings"] = self._extract_key_value(text, ["Total Earnings", "Gross Salary", "Total Pay", "Total Addition", "Total Earning"])
+        data["net_pay"] = self._extract_key_value(text, ["Net Pay", "Net Salary", "Take Home", "NET Salary", "NETPAY", "Net Payable"])
+        data["total_earnings"] = self._extract_key_value(text, ["Total Earnings", "Gross Salary", "Total Pay", "Total Addition", "Total Earning", "Total"])
         data["total_deductions"] = self._extract_key_value(text, ["Total Deductions", "Total Deduction"])
+        
+        # OVERRIDE with Custom NER if available
+        if self.ner_model:
+            doc = self.ner_model(text)
+            for ent in doc.ents:
+                if ent.label_ == "SALARY":
+                    val = self._parse_float(ent.text)
+                    if val: data["total_earnings"] = val # Map SALARY to Total Earnings
+                elif ent.label_ == "NET_PAY":
+                    val = self._parse_float(ent.text)
+                    if val: data["net_pay"] = val
+                elif ent.label_ == "EMPLOYEE_NAME":
+                    # Prepend to names list so it's prioritized
+                    if ent.text.strip():
+                        data["names"].insert(0, ent.text.strip())
         
         # Post-processing: Infer final salary
         data["salary"] = self._infer_salary(data)
         
+        # Smart Math: Reconcile Data
+        data = self._reconcile_data(data)
+        
+        print(f"DEBUG: Net Pay: {data['net_pay']}, Total Earnings: {data['total_earnings']}, Deductions: {data['total_deductions']}")
+        
+        return data
+
+    def _reconcile_data(self, data):
+        """
+        Use math to fill in missing fields.
+        Equation: Net Pay = Total Earnings - Total Deductions
+        """
+        net = data.get("net_pay", 0) or 0
+        earnings = data.get("total_earnings", 0) or 0
+        deductions = data.get("total_deductions", 0) or 0
+        
+        # Case 1: Missing Deductions
+        if deductions == 0 and earnings > 0 and net > 0:
+            if earnings >= net:
+                data["total_deductions"] = earnings - net
+                
+        # Case 2: Missing Net Pay (less likely but possible)
+        elif net == 0 and earnings > 0 and deductions > 0:
+            if earnings >= deductions:
+                data["net_pay"] = earnings - deductions
+                
+        # Case 3: Missing Earnings
+        elif earnings == 0 and net > 0 and deductions > 0:
+            data["total_earnings"] = net + deductions
+            
         return data
 
     def _extract_key_value(self, text, keywords):
         """
-        Find a line containing one of the keywords and extract the number from it.
-        Also checks the NEXT line if no number is found on the same line (common in tables).
+        Find a number associated with a keyword, handling both structured lines and single-line streams.
         """
+        # 1. Try Line-Based Logic (for structured docs)
         lines = text.split('\n')
         for i, line in enumerate(lines):
             for keyword in keywords:
                 if keyword.lower() in line.lower():
-                    # 1. Try finding number on the SAME line
+                    # Same line
                     match = re.search(r"[\d,]+(?:\.\d{2})?", line)
                     if match:
-                        val_str = match.group(0).replace(',', '')
-                        try:
-                            return float(val_str)
-                        except ValueError:
-                            pass
+                        val = self._parse_float(match.group(0))
+                        if val: return val
                     
-                    # 2. Try finding number on the NEXT line (if it exists)
+                    # Next line
                     if i + 1 < len(lines):
                         next_line = lines[i+1]
-                        # Ensure next line isn't another keyword (heuristic)
                         if not any(k.lower() in next_line.lower() for k in ["Name", "Designation", "Month"]):
                             match_next = re.search(r"[\d,]+(?:\.\d{2})?", next_line)
                             if match_next:
-                                val_str = match_next.group(0).replace(',', '')
-                                try:
-                                    return float(val_str)
-                                except ValueError:
-                                    pass
+                                val = self._parse_float(match_next.group(0))
+                                if val: return val
+
+        # 2. Fallback: Stream-Based Logic (for single-line OCR)
+        # Look for Keyword followed by some chars (non-greedy) then a number
+        # We limit the gap to ~100 chars to avoid matching across too much text
+        for keyword in keywords:
+            # Pattern: Keyword ... (junk) ... Number
+            # Case insensitive search
+            pattern = re.compile(re.escape(keyword) + r".{0,100}?([\d,]+(?:\.\d{2})?)", re.IGNORECASE | re.DOTALL)
+            match = pattern.search(text)
+            if match:
+                val = self._parse_float(match.group(1))
+                if val: return val
+                
         return 0.0
+
+    def _parse_float(self, val_str):
+        try:
+            val_str = val_str.replace(',', '')
+            val = float(val_str)
+            if 1990 <= val <= 2100: # Ignore years
+                return None
+            return val
+        except ValueError:
+            return None
 
     def _extract_regex(self, text, key):
         match = re.search(self.patterns[key], text)
@@ -103,18 +176,19 @@ class DataExtractor:
             doc = nlp(text)
             names = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
         
-        # 2. Fallback to Regex if empty (useful for mock data)
+        # 2. Fallback to Regex
         if not names:
             # Try "Name: ..." pattern
-            match = re.search(self.patterns["name_regex"], text)
-            if match:
-                raw_name = match.group(1).strip().split('\n')[0]
-                names.append(raw_name)
-            
-            # Try "Employee Name: ..." pattern
-            match = re.search(r"(?:Employee Name|Name of Employee)[\s:]+([A-Za-z ]+)", text, re.IGNORECASE)
+            # Updated to stop at common next-field keywords
+            match = re.search(r"(?:Name|Employee Name|Emp Name)[\s:_]+([A-Za-z ]+?)(?=\s+(?:Total|Designation|Id|Pan|Bank|Date|\d))", text, re.IGNORECASE)
             if match:
                 names.append(match.group(1).strip())
+            
+            # Fallback for simple "Name: Value" at end of line or string
+            if not names:
+                 match = re.search(r"(?:Name|Employee Name|Emp Name)[\s:_]+([A-Za-z ]+)(?:\n|$)", text, re.IGNORECASE)
+                 if match:
+                    names.append(match.group(1).strip())
         
         return names
 
@@ -128,13 +202,14 @@ class DataExtractor:
         Determine the final salary value to use.
         Priority: Net Pay > Total Earnings > Max Amount Found
         """
+        # 1. Trust explicit fields first
         if data.get("net_pay", 0) > 0:
             return data["net_pay"]
         
         if data.get("total_earnings", 0) > 0:
             return data["total_earnings"]
             
-        # Fallback to finding max amount from regex
+        # 2. Fallback to finding max amount from regex, but filter out years
         amounts = data.get("amounts", [])
         if not amounts: return 0.0
         
@@ -144,6 +219,10 @@ class DataExtractor:
             clean = re.sub(r"[^\d.]", "", clean)
             try:
                 val = float(clean)
+                # Filter out likely years (2000-2100) if they are the only match, 
+                # but keep them if they are part of a larger set (unlikely to be salary anyway if < 3000)
+                if 1990 <= val <= 2100:
+                    continue
                 clean_amounts.append(val)
             except ValueError:
                 continue

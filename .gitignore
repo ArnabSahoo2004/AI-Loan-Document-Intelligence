@@ -22,3 +22,14 @@ venv.bak/
 install.log
 *.log
 .DS_Store
+debug_output.txt
+output.txt
+
+# Data
+data/kaggle_dataset/
+data/uploads/
+# Keep data/training_data_final.csv
+
+# Models
+# models/ner_model/ # Uncomment if too large, but usually spacy models are fine
+# models/anomaly_model.pkl # Keep for now

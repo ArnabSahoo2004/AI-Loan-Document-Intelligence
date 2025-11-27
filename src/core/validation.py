@@ -24,7 +24,10 @@ class Validator:
             value = data.get(field)
             # Check if None or Empty List
             if not value or (isinstance(value, list) and len(value) == 0):
-                issues.append(f"Missing mandatory field: {field}")
+                if field == "pan":
+                    issues.append(f"Missing field: {field}") # Downgrade to warning
+                else:
+                    issues.append(f"Missing mandatory field: {field}")
             # Check if List contains only empty strings
             elif isinstance(value, list) and all(isinstance(s, str) and s.strip() == "" for s in value):
                 issues.append(f"Missing mandatory field: {field} (Found empty)")
